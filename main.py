@@ -179,7 +179,66 @@ def extract_one(src: Source, item: dict, key: str) -> bytes:
             return to_png(out)
     raise RuntimeError("Không tìm thấy hình khớp mô tả")
 
+# ---------- Chia PDF thành đoạn trang (cho hệ thống Ngân hàng câu hỏi) ----------
+_CACHE = {"key": None, "doc": None}
+_LOCK = threading.Lock()
+MAX_CHUNK_BYTES = 13 * 1024 * 1024   # đoạn nặng hơn mức này không gửi inline cho Gemini được
 
+
+def drive_download(file_id: str, token: str) -> bytes:
+    r = requests.get(
+        f"https://www.googleapis.com/drive/v3/files/{file_id}",
+        params={"alt": "media", "supportsAllDrives": "true"},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=300,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Drive HTTP {r.status_code}: {r.text[:200]}")
+    return r.content
+
+
+def open_cached(file_id: str, ver: str, token: str):
+    """Tải file từ Drive một lần rồi nhớ lại, các đoạn sau dùng lại không tải nữa."""
+    import fitz
+    key = (file_id, ver)
+    if _CACHE["key"] != key:
+        if _CACHE["doc"] is not None:
+            _CACHE["doc"].close()
+        _CACHE["key"], _CACHE["doc"] = None, None
+        _CACHE["doc"] = fitz.open(stream=drive_download(file_id, token), filetype="pdf")
+        _CACHE["key"] = key
+    return _CACHE["doc"]
+
+
+@app.post("/chunk")
+def chunk():
+    if not API_SECRET or not hmac.compare_digest(request.headers.get("X-Api-Secret", ""), API_SECRET):
+        return jsonify({"error": "unauthorized"}), 401
+    body = request.get_json(force=True, silent=True) or {}
+    file_id, token, ver = body.get("file_id"), body.get("token"), str(body.get("ver") or "")
+    if not (file_id and token):
+        return jsonify({"error": "thiếu file_id/token"}), 400
+    try:
+        start, end = int(body.get("from") or 1), int(body.get("to") or 1)
+    except (TypeError, ValueError):
+        return jsonify({"error": "from/to không hợp lệ"}), 400
+    try:
+        import fitz
+        with _LOCK:
+            src = open_cached(file_id, ver, token)
+            n = src.page_count
+            start, end = max(1, start), min(end, n)
+            if start > end:
+                return jsonify({"n_pages": n, "from": start, "to": end, "data": ""})
+            out = fitz.open()
+            out.insert_pdf(src, from_page=start - 1, to_page=end - 1)
+            data = out.tobytes(garbage=3, deflate=True)
+            out.close()
+    except Exception as e:
+        return jsonify({"error": str(e)[:300]}), 500
+    if len(data) > MAX_CHUNK_BYTES:
+        return jsonify({"error": f"đoạn trang {start}-{end} nặng {len(data) // 1048576} MB, quá lớn"}), 413
+    return jsonify({"n_pages": n, "from": start, "to": end, "data": base64.b64encode(data).decode()})
 # ---------- HTTP ----------
 @app.get("/")
 def health():
