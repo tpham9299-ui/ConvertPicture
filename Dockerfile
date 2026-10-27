@@ -1,4 +1,10 @@
 FROM python:3.12-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libreoffice-writer fontconfig \
+    fonts-liberation fonts-dejavu-core fonts-stix \
+    fonts-crosextra-carlito fonts-crosextra-caladea \
+    && rm -rf /var/lib/apt/lists/*
+ENV HOME=/tmp
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
