@@ -22,6 +22,7 @@ import time
 import threading
 import subprocess
 import tempfile
+import shutil
 
 import requests
 from flask import Flask, jsonify, request
@@ -182,21 +183,10 @@ def extract_one(src: Source, item: dict, key: str) -> bytes:
     raise RuntimeError("Không tìm thấy hình khớp mô tả")
 
 # ---------- Chia PDF thành đoạn trang (cho hệ thống Ngân hàng câu hỏi) ----------
-_CACHE = {"key": None, "doc": None}
+_CACHE = {"key": None, "doc": None, "path": None}
 _LOCK = threading.Lock()
 MAX_CHUNK_BYTES = 13 * 1024 * 1024   # đoạn nặng hơn mức này không gửi inline cho Gemini được
-
-
-def drive_download(file_id: str, token: str) -> bytes:
-    r = requests.get(
-        f"https://www.googleapis.com/drive/v3/files/{file_id}",
-        params={"alt": "media", "supportsAllDrives": "true"},
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=300,
-    )
-    if r.status_code != 200:
-        raise RuntimeError(f"Drive HTTP {r.status_code}: {r.text[:200]}")
-    return r.content
+COMPRESS_LEVELS = [(150, 75), (120, 65)]   # (dpi đích, chất lượng JPEG), thử lần lượt khi đoạn quá nặng
 
 
 def docx_to_pdf_bytes(raw: bytes) -> bytes:
@@ -218,20 +208,86 @@ def docx_to_pdf_bytes(raw: bytes) -> bytes:
             return fh.read()
 
 
+def drive_download_to_file(file_id: str, token: str, path: str):
+    """Tải từng khối 1 MB thẳng xuống đĩa, không giữ cả file trong RAM."""
+    with requests.get(
+        f"https://www.googleapis.com/drive/v3/files/{file_id}",
+        params={"alt": "media", "supportsAllDrives": "true"},
+        headers={"Authorization": f"Bearer {token}"},
+        stream=True, timeout=(30, 600),
+    ) as r:
+        if r.status_code != 200:
+            raise RuntimeError(f"Drive HTTP {r.status_code}: {r.text[:200]}")
+        with open(path, "wb") as fh:
+            for part in r.iter_content(1024 * 1024):
+                if part:
+                    fh.write(part)
+
+
+def _drop_cache():
+    if _CACHE["doc"] is not None:
+        try:
+            _CACHE["doc"].close()
+        except Exception:
+            pass
+    if _CACHE["path"]:
+        try:
+            os.remove(_CACHE["path"])
+        except OSError:
+            pass
+    _CACHE.update(key=None, doc=None, path=None)
+
+
 def open_cached(file_id: str, ver: str, token: str):
-    """Tải file từ Drive một lần (DOCX thì đổi sang PDF), các đoạn sau dùng lại."""
+    """Tải file một lần (DOCX thì đổi sang PDF), các đoạn sau dùng lại không tải nữa."""
     import fitz
     key = (file_id, ver)
     if _CACHE["key"] != key:
-        if _CACHE["doc"] is not None:
-            _CACHE["doc"].close()
-        _CACHE["key"], _CACHE["doc"] = None, None
-        raw = drive_download(file_id, token)
-        if raw[:2] == b"PK":          # DOCX là file zip; PDF thì bắt đầu bằng %PDF
-            raw = docx_to_pdf_bytes(raw)
-        _CACHE["doc"] = fitz.open(stream=raw, filetype="pdf")
-        _CACHE["key"] = key
+        _drop_cache()
+        fd, path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        try:
+            drive_download_to_file(file_id, token, path)
+            with open(path, "rb") as fh:
+                head = fh.read(2)
+            if head == b"PK":                      # DOCX là file zip; PDF bắt đầu bằng %PDF
+                with open(path, "rb") as fh:
+                    raw = fh.read()
+                pdf = docx_to_pdf_bytes(raw)
+                del raw
+                with open(path, "wb") as fh:
+                    fh.write(pdf)
+                del pdf
+            doc = fitz.open(path, filetype="pdf")  # đọc từ đĩa, không nạp hết vào RAM
+        except Exception:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            raise
+        _CACHE.update(key=key, doc=doc, path=path)
     return _CACHE["doc"]
+
+
+def build_chunk(src, start: int, end: int):
+    """Cắt trang start..end thành PDF nhỏ; nếu quá nặng thì nén ảnh. Trả (bytes, mô tả mức nén hoặc None)."""
+    import fitz
+    out = fitz.open()
+    try:
+        out.insert_pdf(src, from_page=start - 1, to_page=end - 1)
+        data = out.tobytes(garbage=3, deflate=True)
+        reduced = None
+        if len(data) > MAX_CHUNK_BYTES and hasattr(out, "rewrite_images"):
+            for dpi, q in COMPRESS_LEVELS:
+                out.rewrite_images(dpi_threshold=dpi + 20, dpi_target=dpi, quality=q)
+                data = out.tobytes(garbage=3, deflate=True)
+                reduced = f"{dpi}dpi/q{q}"
+                if len(data) <= MAX_CHUNK_BYTES:
+                    break
+        return data, reduced
+    finally:
+        out.close()
+
 
 @app.post("/chunk")
 def chunk():
@@ -246,21 +302,19 @@ def chunk():
     except (TypeError, ValueError):
         return jsonify({"error": "from/to không hợp lệ"}), 400
     try:
-        import fitz
         with _LOCK:
             src = open_cached(file_id, ver, token)
             n = src.page_count
             start, end = max(1, start), min(end, n)
             if start > end:
                 return jsonify({"n_pages": n, "from": start, "to": end, "data": ""})
-            out = fitz.open()
-            out.insert_pdf(src, from_page=start - 1, to_page=end - 1)
-            data = out.tobytes(garbage=3, deflate=True)
-            out.close()
+            data, reduced = build_chunk(src, start, end)
     except Exception as e:
         return jsonify({"error": str(e)[:300]}), 500
     if len(data) > MAX_CHUNK_BYTES:
         return jsonify({"error": f"đoạn trang {start}-{end} nặng {len(data) // 1048576} MB, quá lớn"}), 413
+    if reduced:
+        print(f"Đã nén ảnh đoạn {start}-{end} ({reduced}) còn {len(data) // 1024} KB", flush=True)
     return jsonify({"n_pages": n, "from": start, "to": end, "data": base64.b64encode(data).decode()})
 # ---------- HTTP ----------
 @app.get("/")
