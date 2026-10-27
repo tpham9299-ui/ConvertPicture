@@ -20,6 +20,8 @@ import json
 import os
 import time
 import threading
+import subprocess
+import tempfile
 
 import requests
 from flask import Flask, jsonify, request
@@ -197,18 +199,39 @@ def drive_download(file_id: str, token: str) -> bytes:
     return r.content
 
 
+def docx_to_pdf_bytes(raw: bytes) -> bytes:
+    """Đổi DOCX sang PDF bằng LibreOffice, hoàn toàn trong thư mục tạm."""
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, "in.docx")
+        with open(src, "wb") as fh:
+            fh.write(raw)
+        r = subprocess.run(
+            ["soffice", f"-env:UserInstallation=file://{td}/lo_profile",
+             "--headless", "--norestore", "--nolockcheck",
+             "--convert-to", "pdf:writer_pdf_Export", "--outdir", td, src],
+            capture_output=True, timeout=240,
+        )
+        out = os.path.join(td, "in.pdf")
+        if not os.path.exists(out):
+            raise RuntimeError("LibreOffice không tạo được PDF: " + r.stderr.decode(errors="ignore")[:200])
+        with open(out, "rb") as fh:
+            return fh.read()
+
+
 def open_cached(file_id: str, ver: str, token: str):
-    """Tải file từ Drive một lần rồi nhớ lại, các đoạn sau dùng lại không tải nữa."""
+    """Tải file từ Drive một lần (DOCX thì đổi sang PDF), các đoạn sau dùng lại."""
     import fitz
     key = (file_id, ver)
     if _CACHE["key"] != key:
         if _CACHE["doc"] is not None:
             _CACHE["doc"].close()
         _CACHE["key"], _CACHE["doc"] = None, None
-        _CACHE["doc"] = fitz.open(stream=drive_download(file_id, token), filetype="pdf")
+        raw = drive_download(file_id, token)
+        if raw[:2] == b"PK":          # DOCX là file zip; PDF thì bắt đầu bằng %PDF
+            raw = docx_to_pdf_bytes(raw)
+        _CACHE["doc"] = fitz.open(stream=raw, filetype="pdf")
         _CACHE["key"] = key
     return _CACHE["doc"]
-
 
 @app.post("/chunk")
 def chunk():
