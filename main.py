@@ -23,6 +23,7 @@ import threading
 import subprocess
 import tempfile
 import shutil
+import resource
 
 import requests
 from flask import Flask, jsonify, request
@@ -291,6 +292,7 @@ def build_chunk(src, start: int, end: int):
 
 @app.post("/chunk")
 def chunk():
+    t0 = time.time()
     if not API_SECRET or not hmac.compare_digest(request.headers.get("X-Api-Secret", ""), API_SECRET):
         return jsonify({"error": "unauthorized"}), 401
     body = request.get_json(force=True, silent=True) or {}
@@ -310,11 +312,14 @@ def chunk():
                 return jsonify({"n_pages": n, "from": start, "to": end, "data": ""})
             data, reduced = build_chunk(src, start, end)
     except Exception as e:
+        print(f"[chunk] LỖI trang {start}-{end}: {e}", flush=True)
         return jsonify({"error": str(e)[:300]}), 500
     if len(data) > MAX_CHUNK_BYTES:
         return jsonify({"error": f"đoạn trang {start}-{end} nặng {len(data) // 1048576} MB, quá lớn"}), 413
     if reduced:
         print(f"Đã nén ảnh đoạn {start}-{end} ({reduced}) còn {len(data) // 1024} KB", flush=True)
+    peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+    print(f"[chunk] trang {start}-{end}/{n}: {len(data) // 1024} KB, {time.time() - t0:.1f}s, RAM đỉnh {peak_mb} MB", flush=True)
     return jsonify({"n_pages": n, "from": start, "to": end, "data": base64.b64encode(data).decode()})
 # ---------- HTTP ----------
 @app.get("/")
